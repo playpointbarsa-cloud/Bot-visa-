@@ -1,5 +1,4 @@
 import os
-import re
 import io
 import psycopg
 from psycopg.rows import tuple_row
@@ -8,11 +7,9 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# يأخذ أول 6 أرقام من بداية السطر
-LINE_PREFIX_RE = re.compile(r"^\s*(\d{6})")
-
-MAX_INLINE = 80          # لو النتائج قليلة يرسلها رسالة
-MAX_RESULTS = 200000     # حد أقصى للنتائج
+MAX_INLINE = 60          # لو النتائج قليلة يرسلها رسالة
+MAX_RESULTS = 50000      # حد أقصى للنتائج
+MIN_QUERY_LEN = 3        # أقل طول بحث (عشان ما يجيب كل حاجة)
 
 def get_conn():
     dsn = os.getenv("DATABASE_URL")
@@ -23,26 +20,28 @@ def get_conn():
 def db_init():
     with get_conn() as con:
         with con.cursor() as cur:
+            # تسريع بحث LIKE %...% عبر trigram
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS numbers (
-                    line TEXT PRIMARY KEY,
-                    prefix6 TEXT GENERATED ALWAYS AS (left(line, 6)) STORED
+                CREATE TABLE IF NOT EXISTS lines (
+                    line TEXT PRIMARY KEY
                 );
             """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_prefix6 ON numbers(prefix6);")
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_lines_trgm
+                ON lines USING GIN (line gin_trgm_ops);
+            """)
 
-def db_insert_many(lines: list[str]) -> int:
-    if not lines:
+def db_insert_lines(raw_lines: list[str]) -> int:
+    if not raw_lines:
         return 0
 
-    # نظف السطور: احذف الفارغ، وخلي اللي يبدأ بـ 6 أرقام على الأقل
+    # تنظيف + إزالة تكرار داخل الملف
     cleaned = []
     seen = set()
-    for ln in lines:
+    for ln in raw_lines:
         ln = ln.strip()
         if not ln:
-            continue
-        if not LINE_PREFIX_RE.match(ln):
             continue
         if ln in seen:
             continue
@@ -55,69 +54,73 @@ def db_insert_many(lines: list[str]) -> int:
     inserted = 0
     with get_conn() as con:
         with con.cursor() as cur:
-            chunk_size = 3000
-            for i in range(0, len(cleaned), chunk_size):
-                chunk = cleaned[i:i+chunk_size]
-                placeholders = ",".join(["(%s)"] * len(chunk))
-                q = f"""
-                    INSERT INTO numbers(line)
-                    VALUES {placeholders}
-                    ON CONFLICT (line) DO NOTHING
-                """
-                cur.execute(q, chunk)
+            q = """
+                INSERT INTO lines(line)
+                VALUES (%s)
+                ON CONFLICT (line) DO NOTHING
+            """
+            # إدخال ثابت وآمن (مش الأسرع، لكنه ما ينهارش)
+            for ln in cleaned:
+                cur.execute(q, (ln,))
                 inserted += cur.rowcount or 0
+
     return inserted
 
-def db_find(prefix6: str, limit: int = MAX_RESULTS) -> list[str]:
+def db_search_any(query: str, limit: int = MAX_RESULTS) -> list[str]:
+    # بحث substring
     with get_conn() as con:
         with con.cursor() as cur:
             cur.execute(
-                "SELECT line FROM numbers WHERE prefix6=%s LIMIT %s",
-                (prefix6, limit)
+                "SELECT line FROM lines WHERE line LIKE %s LIMIT %s",
+                (f"%{query}%", limit)
             )
             return [r[0] for r in cur.fetchall()]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ ابعت ملف .txt فيه سطور (كل سطر يبدأ برقم).\n"
-        "🔎 للبحث: /find 123456 أو ابعت 123456 لوحدها.\n"
-        "📄 النتائج تُرسل بنفس شكل السطر في الملف."
+        "✅ ابعت ملف .txt (كل سطر بيانات)، وأنا هحفظه.\n"
+        "🔎 ابعت أي رقم/جزء رقم للبحث (مش شرط 6 أرقام).\n"
+        "مثال: اكتب 9721 أو /find 9721\n"
+        "📄 لو النتائج كتير هتجيلك كملف."
     )
 
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("استخدم: /find 123456")
+        await update.message.reply_text("استخدم: /find 9721")
         return
-    p = context.args[0].strip()
-    if not (p.isdigit() and len(p) == 6):
-        await update.message.reply_text("لازم تكتب 6 أرقام بالظبط. مثال: /find 401795")
-        return
-    await send_results(update, p)
+    q = context.args[0].strip()
+    await send_results(update, q)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.isdigit() and len(text) == 6:
-        await send_results(update, text)
+    q = (update.message.text or "").strip()
+    if q and not q.startswith("/"):
+        await send_results(update, q)
 
-async def send_results(update: Update, prefix6: str):
-    results = db_find(prefix6)
+async def send_results(update: Update, query: str):
+    # نخليها أرقام فقط (لو عايز تسمح بحروف، شيل الشرط ده)
+    if not query.isdigit():
+        await update.message.reply_text("ابعت أرقام فقط للبحث.")
+        return
 
+    if len(query) < MIN_QUERY_LEN:
+        await update.message.reply_text(f"اكتب على الأقل {MIN_QUERY_LEN} أرقام للبحث.")
+        return
+
+    results = db_search_any(query)
     if not results:
         await update.message.reply_text("❌ لا توجد نتائج.")
         return
 
-    # لو عايز تضيف |555|55 بعد كل سطر فكّ التعليق:
+    # لو عايز تضيف |555|55 بعد كل سطر فك التعليق:
     # results = [f"{line}|555|55" for line in results]
 
     count = len(results)
-
     if count <= MAX_INLINE:
         await update.message.reply_text("\n".join(results))
         return
 
     bio = io.BytesIO("\n".join(results).encode("utf-8"))
-    bio.name = f"results_{prefix6}_{count}.txt"
-
+    bio.name = f"results_{query}_{count}.txt"
     await update.message.reply_text(f"✅ عدد النتائج: {count} — هبعتهم كملف.")
     await update.message.reply_document(document=bio)
 
@@ -134,12 +137,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await f.download_as_bytearray()
     text = data.decode("utf-8", errors="ignore")
 
-    # نخزن سطر-بسطر (شكل الملف)
     lines = text.splitlines()
-
-    await update.message.reply_text(f"⏳ جاري حفظ السطور… (عددها: {len(lines)})")
-    inserted = db_insert_many(lines)
-
+    await update.message.reply_text(f"⏳ جاري الحفظ… عدد السطور: {len(lines)}")
+    inserted = db_insert_lines(lines)
     await update.message.reply_text(f"✅ تم حفظ {inserted} سطر جديد (المكرر تجاهل).")
 
 def main():
