@@ -4,13 +4,15 @@ import io
 import psycopg
 from psycopg.rows import tuple_row
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.ext import AIORateLimiter
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
-NUM_RE = re.compile(r"\b\d{6,}\b")
+# يأخذ أول 6 أرقام من بداية السطر
+LINE_PREFIX_RE = re.compile(r"^\s*(\d{6})")
 
-MAX_INLINE = 80          # لو النتائج قليلة يبعثها رسالة
-MAX_RESULTS = 200000     # حد أقصى للبحث
+MAX_INLINE = 80          # لو النتائج قليلة يرسلها رسالة
+MAX_RESULTS = 200000     # حد أقصى للنتائج
 
 def get_conn():
     dsn = os.getenv("DATABASE_URL")
@@ -23,28 +25,44 @@ def db_init():
         with con.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS numbers (
-                    num TEXT PRIMARY KEY,
-                    prefix6 TEXT GENERATED ALWAYS AS (left(num, 6)) STORED
+                    line TEXT PRIMARY KEY,
+                    prefix6 TEXT GENERATED ALWAYS AS (left(line, 6)) STORED
                 );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_prefix6 ON numbers(prefix6);")
 
-def db_insert_many(nums: list[str]) -> int:
-    if not nums:
+def db_insert_many(lines: list[str]) -> int:
+    if not lines:
         return 0
-    nums = list(dict.fromkeys(nums))  # remove duplicates in the same file
+
+    # نظف السطور: احذف الفارغ، وخلي اللي يبدأ بـ 6 أرقام على الأقل
+    cleaned = []
+    seen = set()
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        if not LINE_PREFIX_RE.match(ln):
+            continue
+        if ln in seen:
+            continue
+        seen.add(ln)
+        cleaned.append(ln)
+
+    if not cleaned:
+        return 0
 
     inserted = 0
     with get_conn() as con:
         with con.cursor() as cur:
-            chunk_size = 5000
-            for i in range(0, len(nums), chunk_size):
-                chunk = nums[i:i+chunk_size]
+            chunk_size = 3000
+            for i in range(0, len(cleaned), chunk_size):
+                chunk = cleaned[i:i+chunk_size]
                 placeholders = ",".join(["(%s)"] * len(chunk))
                 q = f"""
-                    INSERT INTO numbers(num)
+                    INSERT INTO numbers(line)
                     VALUES {placeholders}
-                    ON CONFLICT (num) DO NOTHING
+                    ON CONFLICT (line) DO NOTHING
                 """
                 cur.execute(q, chunk)
                 inserted += cur.rowcount or 0
@@ -53,14 +71,17 @@ def db_insert_many(nums: list[str]) -> int:
 def db_find(prefix6: str, limit: int = MAX_RESULTS) -> list[str]:
     with get_conn() as con:
         with con.cursor() as cur:
-            cur.execute("SELECT num FROM numbers WHERE prefix6=%s LIMIT %s", (prefix6, limit))
+            cur.execute(
+                "SELECT line FROM numbers WHERE prefix6=%s LIMIT %s",
+                (prefix6, limit)
+            )
             return [r[0] for r in cur.fetchall()]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ ابعت ملف .txt فيه أرقام وأنا هحفظها.\n"
+        "✅ ابعت ملف .txt فيه سطور (كل سطر يبدأ برقم).\n"
         "🔎 للبحث: /find 123456 أو ابعت 123456 لوحدها.\n"
-        "📄 لو النتائج كتير هتجيلك كملف."
+        "📄 النتائج تُرسل بنفس شكل السطر في الملف."
     )
 
 async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,7 +90,7 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     p = context.args[0].strip()
     if not (p.isdigit() and len(p) == 6):
-        await update.message.reply_text("لازم تكتب 6 أرقام بالظبط. مثال: /find 484810")
+        await update.message.reply_text("لازم تكتب 6 أرقام بالظبط. مثال: /find 401795")
         return
     await send_results(update, p)
 
@@ -80,17 +101,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_results(update: Update, prefix6: str):
     results = db_find(prefix6)
+
     if not results:
         await update.message.reply_text("❌ لا توجد نتائج.")
         return
 
+    # لو عايز تضيف |555|55 بعد كل سطر فكّ التعليق:
+    # results = [f"{line}|555|55" for line in results]
+
     count = len(results)
+
     if count <= MAX_INLINE:
-        await update.message.reply_text("✅ النتائج:\n" + "\n".join(results))
+        await update.message.reply_text("\n".join(results))
         return
 
     bio = io.BytesIO("\n".join(results).encode("utf-8"))
     bio.name = f"results_{prefix6}_{count}.txt"
+
     await update.message.reply_text(f"✅ عدد النتائج: {count} — هبعتهم كملف.")
     await update.message.reply_document(document=bio)
 
@@ -107,14 +134,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await f.download_as_bytearray()
     text = data.decode("utf-8", errors="ignore")
 
-    nums = NUM_RE.findall(text)
-    if not nums:
-        await update.message.reply_text("❌ ملقتش أرقام في الملف.")
-        return
+    # نخزن سطر-بسطر (شكل الملف)
+    lines = text.splitlines()
 
-    await update.message.reply_text(f"⏳ لقيت {len(nums)} رقم… بحفظهم.")
-    inserted = db_insert_many(nums)
-    await update.message.reply_text(f"✅ تم حفظ {inserted} رقم جديد (المكرر اتجاهل).")
+    await update.message.reply_text(f"⏳ جاري حفظ السطور… (عددها: {len(lines)})")
+    inserted = db_insert_many(lines)
+
+    await update.message.reply_text(f"✅ تم حفظ {inserted} سطر جديد (المكرر تجاهل).")
 
 def main():
     db_init()
@@ -123,14 +149,13 @@ def main():
     if not token:
         raise RuntimeError("Missing BOT_TOKEN")
 
-    app = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Polling
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
